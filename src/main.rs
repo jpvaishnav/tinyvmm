@@ -193,7 +193,7 @@ fn print_usage() {
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux|bzImage>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
-         \x20              [--large-pages|--no-large-pages] [--poll-us N]\n\
+         \x20              [--large-pages|--no-large-pages] [--poll-us N] [--no-doorbells]\n\
          \x20              [--net [--net-backend loopback|nat|smoltcp|slirp|gvisor|wintun]\n\
          \x20              [--portfwd H:G]... [--nat-workers N] [--nat-host-local]]...\n\
          \x20              (repeat --net per NIC)\n\
@@ -220,7 +220,7 @@ fn print_usage() {
          \x20              No kernel path: boot the default GRUB entry of the Linux installed on\n\
          \x20              the first drive with one (ext2/3/4 /boot, read before the VM starts).\n\
          \x20 tinyvmm --restore <path> [--drive <path>[,ro|rw]]... [--cpu-affinity p|p-physical|e|all]\n\
-         \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive] [--poll-us N]\n\
+         \x20              [--watchdog-secs N] [--unsafe-restore-mutable-drive] [--poll-us N] [--no-doorbells]\n\
          \x20              [--record <file.mp4>[,fps=N][,kbps=N]]\n\
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
          \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
@@ -1062,6 +1062,7 @@ struct PvhArgs {
     with_input: bool,
     with_sound: bool,
     large_pages: bool,
+    doorbells: bool,
     /// `--record`: tee the GPU scanout (+ sound) into an MP4.
     record: Option<RecordSpec>,
     /// VMBus with the time-sync and shutdown ICs (`vmbus`): on unless
@@ -1134,6 +1135,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut unsafe_save_mutable_drive = false;
     let mut with_input = false;
     let mut with_sound = false;
+    let mut doorbells = true;
     let mut record: Option<RecordSpec> = None;
     // A failed or fragmented large-page allocation can stall startup for
     // hundreds of milliseconds, so latency-oriented appliance builds opt in.
@@ -1295,6 +1297,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             "--input" => with_input = true,
             "--large-pages" => large_pages = true,
             "--no-large-pages" => large_pages = false,
+            "--no-doorbells" => doorbells = false,
             "--poll-us" => {
                 i += 1;
                 virtio::transport::set_poll_max_us(parse_poll_us(args.get(i))?);
@@ -1552,6 +1555,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         with_input,
         with_sound,
         large_pages,
+        doorbells,
         record,
         vmbus,
     })
@@ -1766,6 +1770,9 @@ impl Drop for ReleaseBeforeTeardown<'_> {
 
 fn run_pvh_run(args: &[String]) -> Result<i32> {
     let cfg = parse_pvh_args(args)?;
+    if !cfg.doorbells {
+        eprintln!("[pvh-run] WHP MMIO doorbells disabled; queue notifications use MMIO exits.");
+    }
 
     // Snapshot save preconditions (mirror the C++, relaxed for net): a snapshot
     // must capture a self-contained machine. virtio-net AND virtio-9p are both
@@ -2000,7 +2007,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         num_msix_vectors: 3, // rx + tx + config-change
         pci_class: 0x07,     // simple communication controller
         pci_subclass: 0x80,  // other
-        doorbells: true,     // suppress per-kick VM exits on the console too
+        doorbells: cfg.doorbells,
     };
     let vcon = PciTransport::new(
         "virtio-pci-console",
@@ -2051,7 +2058,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             num_msix_vectors: 3, // rx + tx + config-change
             pci_class: 0x02,     // network controller
             pci_subclass: 0x00,
-            doorbells: true, // hot path: suppress the per-kick VM exit
+            doorbells: cfg.doorbells,
         };
         let nt = PciTransport::new(
             &format!("virtio-pci-net[{ni}]"),
@@ -2204,7 +2211,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             num_msix_vectors: 2, // requestq + config-change
             pci_class: 0x01,     // mass storage
             pci_subclass: 0x00,  // SCSI controller (canonical for virtio-blk)
-            doorbells: true, // hot I/O path: suppress the per-kick VM exit (the async submit runs on the pump thread)
+            doorbells: cfg.doorbells,
         };
         let bt = PciTransport::new(
             &format!("virtio-pci-blk[{i}]"),
@@ -2274,7 +2281,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             num_msix_vectors: 2, // requestq + config-change
             pci_class: 0xFF,     // unassigned / other
             pci_subclass: 0x00,
-            doorbells: true, // run notify (host file I/O) on the pump thread, off the vCPU, and suppress the exit
+            doorbells: cfg.doorbells,
         };
         let pt = PciTransport::new(
             &format!("virtio-pci-9p[{i}]"),
@@ -3233,6 +3240,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut affinity_mode = AffinityMode::PCore;
     let mut watchdog_secs = 0u32;
     let mut unsafe_restore_mutable_drive = false;
+    let mut doorbells = true;
     let mut record: Option<RecordSpec> = None;
     {
         let mut i = 3;
@@ -3264,6 +3272,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
                         .ok_or_else(|| Error::msg("--watchdog-secs wants an integer"))?;
                 }
                 "--unsafe-restore-mutable-drive" => unsafe_restore_mutable_drive = true,
+                "--no-doorbells" => doorbells = false,
                 "--poll-us" => {
                     i += 1;
                     virtio::transport::set_poll_max_us(parse_poll_us(args.get(i))?);
@@ -3278,7 +3287,8 @@ fn run_restore(args: &[String]) -> Result<i32> {
                 other => {
                     return Err(Error::msg(format!(
                         "--restore: unknown flag '{other}' (want --drive, --cpu-affinity, \
-                         --watchdog-secs, --unsafe-restore-mutable-drive, --poll-us, --record)"
+                         --watchdog-secs, --unsafe-restore-mutable-drive, --poll-us, \
+                         --no-doorbells, --record)"
                     )));
                 }
             }
@@ -3291,6 +3301,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     check_whp_available()?;
     println!("[restore] WHP available");
+    if !doorbells {
+        eprintln!("[restore] WHP MMIO doorbells disabled; queue notifications use MMIO exits.");
+    }
     let mut btimer = diag::boot_timer::BootTimer::new();
     btimer.mark("restore start");
 
@@ -3431,7 +3444,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         num_msix_vectors: 3,
         pci_class: 0x07,
         pci_subclass: 0x80,
-        doorbells: true,
+        doorbells,
     };
     let vcon = PciTransport::new(
         "virtio-pci-console",
@@ -3471,7 +3484,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
             num_msix_vectors: 3,
             pci_class: 0x02,
             pci_subclass: 0x00,
-            doorbells: true,
+            doorbells,
         };
         let nt = PciTransport::new(
             &format!("virtio-pci-net[{ni}]"),
@@ -3634,7 +3647,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
             num_msix_vectors: 2,
             pci_class: 0x01,
             pci_subclass: 0x00,
-            doorbells: true,
+            doorbells,
         };
         let bt = PciTransport::new(
             &format!("virtio-pci-blk[{i}]"),
@@ -3704,7 +3717,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
             num_msix_vectors: 2,
             pci_class: 0xFF,
             pci_subclass: 0x00,
-            doorbells: true,
+            doorbells,
         };
         let pt = PciTransport::new(
             &format!("virtio-pci-9p[{i}]"),

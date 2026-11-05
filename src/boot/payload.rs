@@ -178,6 +178,46 @@ mod tests {
     }
 
     #[test]
+    fn no_doorbells_selects_mmio_notifications_without_changing_guest_args() {
+        let original = parse_pvh_args(&args(&[
+            "tinyvmm",
+            "--pvh-run",
+            "vmlinux",
+            "--",
+            "example.flag=42",
+        ]))
+        .unwrap();
+        assert!(original.doorbells);
+        for extra in [
+            &["--no-doorbells", "vmlinux"][..],
+            &["vmlinux", "--no-doorbells"][..],
+        ] {
+            let mut parts = vec!["tinyvmm", "--pvh-run"];
+            parts.extend_from_slice(extra);
+            parts.extend_from_slice(&["--", "example.flag=42"]);
+            let config = parse_pvh_args(&args(&parts)).unwrap();
+            assert!(!config.doorbells);
+            assert_eq!(config.cmdline, original.cmdline);
+            assert_eq!(config.vmbus, original.vmbus);
+        }
+    }
+
+    #[test]
+    fn no_doorbells_after_separator_is_only_a_kernel_argument() {
+        let config = parse_pvh_args(&args(&[
+            "tinyvmm",
+            "--pvh-run",
+            "vmlinux",
+            "--",
+            "--no-doorbells",
+            "example.flag=42",
+        ]))
+        .unwrap();
+        assert!(config.doorbells);
+        assert!(config.cmdline.ends_with(" --no-doorbells example.flag=42"));
+    }
+
+    #[test]
     fn iso_supplies_kernel_and_first_drive_and_appends_args() {
         let config = parse_pvh_args(&args(&[
             "tinyvmm",
