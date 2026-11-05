@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 mod boot;
+mod cli;
 mod convenience;
 mod devices;
 mod diag;
@@ -29,6 +30,7 @@ use crate::devices::legacy::LegacyIsaStubs;
 use crate::devices::mmio_bus::MmioBus;
 use crate::devices::pic::Pic8259;
 use crate::devices::pit::Pit8254;
+use crate::devices::power::PowerDevice;
 use crate::devices::serial::Serial8250;
 use crate::display::Display;
 use crate::error::{Error, Result, check_hr};
@@ -183,7 +185,8 @@ fn print_usage() {
          \x20 tinyvmm --smoke\n\
          \x20 tinyvmm --blk-selftest        host-side virtio-blk DISCARD/WRITE_ZEROES test\n\
          \x20 tinyvmm --blk-stress          host-side virtio-blk concurrency stress + failure-path test\n\
-         \x20 tinyvmm --create-vhdx <path.vhdx> <size-mb>   create a dynamic disk (no elevation)\n\
+         \x20 tinyvmm --create-vhdx <path.vhdx> <size>   create a dynamic disk (no elevation);\n\
+         \x20              size in MiB, or with a K/M/G/T unit (binary), e.g. 256G\n\
          \x20 tinyvmm --pci-selftest        host-side PCI host-bridge + BAR + sizing test\n\
          \x20 tinyvmm --pvh-info <vmlinux|bzImage>\n\
          \x20 tinyvmm --pvh-run [--initrd <cpio>] [--ram-mb N] [--vcpus N] [--rng] [--input] [--sound]\n\
@@ -198,7 +201,10 @@ fn print_usage() {
          \x20              [--record <file.mp4>[,fps=N][,kbps=N]]  (needs --gpu; records the\n\
          \x20              display + --sound playback to a fragmented H.264/AAC MP4; default 30 fps)\n\
          \x20              [--save <path> [--unsafe-save-mutable-drive]]\n\
-         \x20              [--watchdog-secs N] [--debug-boot] [vmlinux] [-- <cmdline>]\n\
+         \x20              [--watchdog-secs N] [--debug-boot] [--no-default-cmdline]\n\
+         \x20              [vmlinux] [-- <kernel args>]\n\
+         \x20              Kernel args are added to the defaults (console=hvc0 pci=conf1,...);\n\
+         \x20              --no-default-cmdline makes them the whole command line instead.\n\
          \x20              Kernel path is required in plain builds unless a --drive holds an\n\
          \x20              installed Linux (below); appliance builds embed defaults.\n\
          \x20              The kernel may be a PVH ELF vmlinux or a bzImage (vmlinuz).\n\
@@ -213,7 +219,16 @@ fn print_usage() {
          \x20 tinyvmm --dda-probe <PnpInstanceId>   probe a host PCI device for Discrete Device\n\
          \x20              Assignment (no VM boot): dump IDs/BARs/MSI-X, test direct MMIO mapping.\n\
          \x20              Get the id from Device Manager (Details -> Device instance path) or\n\
-         \x20              `Get-PnpDevice`. Dismount it first: Dismount-VMHostAssignableDevice.\n"
+         \x20              `Get-PnpDevice`. Dismount it first: Dismount-VMHostAssignableDevice.\n\
+         \n\
+         The guest powering off or rebooting stops the VM (exit code 0). Closing the\n\
+         --gpu window has the guest sync and remount its filesystems read-only (SysRq\n\
+         on hvc0), then stops it. Ctrl+A X stops at once.\n\
+         \n\
+         An @file argument is replaced by the arguments in that file: split at\n\
+         whitespace, \"double quotes\" keep spaces, # starts a comment line. Its\n\
+         kernel args (after --) go last, so flags may follow it. Quote it in\n\
+         PowerShell, where @ means splatting: tinyvmm '@vm.args' --sound\n"
     );
 }
 
@@ -1093,6 +1108,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     let mut vcpus = 1u32;
     let mut watchdog_secs = 0u32;
     let mut debug_boot = false;
+    let mut default_cmdline = true;
     let mut nics: Vec<NicSpec> = Vec::new();
     let mut with_rng = false;
     let mut with_gpu = false;
@@ -1110,8 +1126,22 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
     // hundreds of milliseconds, so latency-oriented appliance builds opt in.
     let mut large_pages = !boot::payload::BUNDLED;
 
+    // Flags may come before or after the kernel path; only "--" ends them.
+    let mut kernel_path: Option<String> = None;
     let mut i = 2;
-    while i < args.len() && args[i].starts_with("--") && args[i] != "--" {
+    while i < args.len() && args[i] != "--" {
+        if !args[i].starts_with("--") {
+            if let Some(first) = &kernel_path {
+                return Err(Error::msg(format!(
+                    "--pvh-run: unexpected '{}' after the kernel path '{first}' (kernel \
+                     arguments go after --)",
+                    args[i]
+                )));
+            }
+            kernel_path = Some(args[i].clone());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--initrd" => {
                 i += 1;
@@ -1163,6 +1193,7 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
                     .ok_or_else(|| Error::msg("--watchdog-secs wants an integer"))?;
             }
             "--debug-boot" => debug_boot = true,
+            "--no-default-cmdline" => default_cmdline = false,
             "--net" => nics.push(NicSpec::new()),
             "--net-backend" => {
                 i += 1;
@@ -1393,14 +1424,13 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         i += 1;
     }
 
-    let vmlinux = if let Some(path) = args.get(i).filter(|path| path.as_str() != "--") {
+    let vmlinux = if let Some(path) = kernel_path {
         if iso.is_some() {
             return Err(Error::msg(
                 "--iso boots the ISO's own kernel; drop the kernel path",
             ));
         }
-        i += 1;
-        Some(path.clone())
+        Some(path)
     } else if boot::payload::BUNDLED || iso.is_some() || !drives.is_empty() {
         None
     } else {
@@ -1426,18 +1456,19 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
         ));
     }
 
-    // Everything after a bare "--" is the kernel cmdline. With --iso or a
-    // disk boot it is appended to the default cmdline and the boot entry's
-    // own arguments instead.
-    let mut cmdline = String::new();
+    // Everything after a bare "--" is added to the kernel command line: to the
+    // defaults for a kernel path (or, with --no-default-cmdline, it is the
+    // whole command line), and after the boot entry's own arguments with --iso
+    // or a disk boot.
+    let mut user_args = String::new();
     if i < args.len() && args[i] == "--" {
         i += 1;
-        cmdline = args[i..].join(" ");
+        user_args = args[i..].join(" ");
     }
-    let extra_args = if iso.is_some() || disk_boot {
-        std::mem::take(&mut cmdline)
+    let (mut cmdline, extra_args) = if iso.is_some() || disk_boot {
+        (String::new(), user_args)
     } else {
-        String::new()
+        (user_args, String::new())
     };
     if let Some(path) = &iso {
         if drives.len() >= 8 {
@@ -1454,24 +1485,30 @@ fn parse_pvh_args(args: &[String]) -> Result<PvhArgs> {
             },
         );
     }
-    if cmdline.is_empty() {
-        // Phase 2 default: route the kernel console to the virtio-console
-        // (hvc0) so the initramfs /init drops to an interactive shell. With
-        // --debug-boot, also stream early boot to ttyS0 (the 8250) before
-        // hvc0 comes up. pci=conf1 forces our 0xCF8/0xCFC mechanism. Without a
-        // GPU we also disable the kernel framebuffer/KMS (`nofb nomodeset`);
-        // with --gpu we drop those so the virtio-gpu DRM driver can mode-set.
+    if default_cmdline {
+        // Route the kernel console to the virtio-console (hvc0) so the
+        // initramfs /init drops to an interactive shell. With --debug-boot,
+        // also stream early boot to ttyS0 (the 8250) before hvc0 comes up.
+        // pci=conf1 forces our 0xCF8/0xCFC mechanism. Without a GPU we also
+        // disable the kernel framebuffer/KMS (`nofb nomodeset`); with --gpu we
+        // drop those so the virtio-gpu DRM driver can mode-set.
         let fb = if with_gpu { "" } else { " nofb nomodeset" };
-        cmdline = if debug_boot {
+        let mut defaults = if debug_boot {
             format!("earlyprintk=ttyS0,115200 console=hvc0 pci=conf1,nocrs,lastbus=0{fb}")
         } else {
             format!("console=hvc0 pci=conf1,nocrs,lastbus=0{fb}")
         };
         if boot::payload::BUNDLED {
-            cmdline.push_str(" idle=halt");
+            defaults.push_str(" idle=halt");
         }
+        if !cmdline.is_empty() {
+            defaults.push(' ');
+            defaults.push_str(&cmdline);
+        }
+        cmdline = defaults;
     }
-    if boot::payload::BUNDLED
+    if default_cmdline
+        && boot::payload::BUNDLED
         && !cmdline
             .split_whitespace()
             .any(|arg| arg.starts_with("tinyinit.epoch="))
@@ -1891,6 +1928,10 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
 
     let legacy = LegacyIsaStubs::new();
     legacy.attach(&mut io_bus);
+
+    // ACPI power-off and reboot (the FADT points here) stop the VM.
+    let power = PowerDevice::new();
+    power.attach(&mut io_bus);
 
     // Legacy PIC: the only ISA-IRQ -> guest-IDT path in virtual-wire mode.
     let pic = new_pic(&vcpus[0]);
@@ -2312,6 +2353,16 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             }
         }
     };
+    power.set_on_request(stop_all.clone());
+    if let Some(d) = &display {
+        d.set_close_handler(stop_on_window_close(
+            "pvh-run",
+            console.clone(),
+            blk_devices.clone(),
+            hvc0_is_console(&cmdline),
+            stop_all.clone(),
+        ));
+    }
 
     // Watchdog (optional): stop everything after N seconds. Teardown hangs up
     // `watchdog_done`, which wakes it at once rather than after its sleep.
@@ -2364,9 +2415,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
         setup_interactive_console(console.clone(), console_input, stop_all.clone());
 
     // Shutdown sentinel watcher: the guest prints this marker on hvc0 to
-    // request a clean stop. Harnesses rely on it because an ACPI-less
-    // `poweroff` falls back to STI;HLT and never produces a halt VM-exit,
-    // which would otherwise leave us spinning idle. We scan the console TX
+    // request a clean stop. Harnesses use it: it predates ACPI power-off, and
+    // it still stops a kernel built without ACPI, whose `poweroff` falls back
+    // to STI;HLT and never produces a halt VM-exit. We scan the console TX
     // byte stream (guest -> host) for the sentinel and stop every vCPU.
     {
         const SENTINEL: &[u8] = b"=== tinyvmm shutdown requested ===";
@@ -2457,6 +2508,9 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
             eprintln!("[pvh-run] vCPU {} (AP) stopped abnormally: {:?}", i + 1, r);
         }
     }
+    if let Some(r) = power.request() {
+        println!("[pvh-run] {}", r.describe());
+    }
     if let Some(w) = watchdog {
         let _ = w.join();
     }
@@ -2527,6 +2581,7 @@ fn run_pvh_run(args: &[String]) -> Result<i32> {
                 &pit,
                 &com1,
                 &legacy,
+                &power,
                 &pci_bus,
                 &transports,
                 &blk_backends,
@@ -2891,6 +2946,7 @@ fn write_snapshot(
     pit: &Arc<Pit8254>,
     com1: &Arc<Serial8250>,
     legacy: &Arc<LegacyIsaStubs>,
+    power: &Arc<PowerDevice>,
     pci_bus: &Arc<PciBus>,
     transports: &[Arc<PciTransport>],
     blk_backends: &[Arc<BlockFile>],
@@ -3033,6 +3089,7 @@ fn write_snapshot(
     w.write_section(SectionType::LegacyPit8254, &pit.snapshot_capture())?;
     w.write_section(SectionType::LegacySerial8250, &com1.snapshot_capture())?;
     w.write_section(SectionType::LegacyIsaStubs, &legacy.snapshot_capture())?;
+    w.write_section(SectionType::AcpiPm, &power.snapshot_capture())?;
     w.write_section(SectionType::LegacyPciBus, &pci_bus.snapshot_capture())?;
 
     // Per-PCI-device sections: [u16 device_index][DeviceSnapshot]. One blob per
@@ -3274,6 +3331,8 @@ fn run_restore(args: &[String]) -> Result<i32> {
     pit.attach(&mut io_bus);
     let legacy = LegacyIsaStubs::new();
     legacy.attach(&mut io_bus);
+    let power = PowerDevice::new();
+    power.attach(&mut io_bus);
     let pic = new_pic(&vcpus[0]);
     pic.attach(&mut io_bus);
     {
@@ -3647,6 +3706,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
     let mut sec_pit: Option<Vec<u8>> = None;
     let mut sec_serial: Option<Vec<u8>> = None;
     let mut sec_isa: Option<Vec<u8>> = None;
+    let mut sec_pm: Option<Vec<u8>> = None;
     let mut sec_bus: Option<Vec<u8>> = None;
     let mut sec_devices: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut caps: Vec<vs::CapturedVcpuState> = (0..vcpu_count)
@@ -3670,6 +3730,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
             SectionType::LegacyPit8254 => sec_pit = Some(s.payload.to_vec()),
             SectionType::LegacySerial8250 => sec_serial = Some(s.payload.to_vec()),
             SectionType::LegacyIsaStubs => sec_isa = Some(s.payload.to_vec()),
+            SectionType::AcpiPm => sec_pm = Some(s.payload.to_vec()),
             SectionType::LegacyPciBus => sec_bus = Some(s.payload.to_vec()),
             SectionType::PciDevice => {
                 if s.payload.len() < 2 {
@@ -3752,7 +3813,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
 
     // Validate section cardinality before touching device state: a Rust-written
     // snapshot always carries exactly one RAM section, one VcpuRegs per vCPU, all
-    // six HV/legacy singletons, and one PciDevice section per device. A mismatch
+    // seven HV/legacy singletons, and one PciDevice section per device. A mismatch
     // means a truncated, corrupt, or foreign (e.g. C++-written) file.
     if n_ram != 1 {
         return Err(Error::msg(format!(
@@ -3769,6 +3830,7 @@ fn run_restore(args: &[String]) -> Result<i32> {
         || sec_pit.is_none()
         || sec_serial.is_none()
         || sec_isa.is_none()
+        || sec_pm.is_none()
         || sec_bus.is_none()
     {
         return Err(Error::msg(
@@ -3795,6 +3857,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
     }
     if let Some(b) = sec_isa {
         legacy.snapshot_apply(&b);
+    }
+    if let Some(b) = sec_pm {
+        power.snapshot_apply(&b);
     }
     if let Some(b) = sec_bus {
         pci_bus.snapshot_apply(&b);
@@ -3862,6 +3927,18 @@ fn run_restore(args: &[String]) -> Result<i32> {
             }
         }
     };
+    power.set_on_request(stop_all.clone());
+    if let Some(d) = &display {
+        // A snapshot doesn't record the kernel command line; the default one
+        // makes hvc0 the console.
+        d.set_close_handler(stop_on_window_close(
+            "restore",
+            console.clone(),
+            blk_devices.clone(),
+            true,
+            stop_all.clone(),
+        ));
+    }
 
     let window_owns_input = display.is_some() && input_devices.is_some();
     if window_owns_input {
@@ -3976,6 +4053,9 @@ fn run_restore(args: &[String]) -> Result<i32> {
         if !matches!(r, StopReason::GuestHalted | StopReason::Cancelled) {
             eprintln!("[restore] vCPU {} (AP) stopped abnormally: {:?}", i + 1, r);
         }
+    }
+    if let Some(r) = power.request() {
+        println!("[restore] {}", r.describe());
     }
     if let Some(w) = watchdog {
         let _ = w.join();
@@ -4114,6 +4194,81 @@ fn add_input_devices(
     transports.push(tt);
 
     InputDevices { keyboard, tablet }
+}
+
+/// Whether `cmdline` makes hvc0 a kernel console, which its ^O SysRq hook
+/// needs.
+fn hvc0_is_console(cmdline: &str) -> bool {
+    cmdline
+        .split_ascii_whitespace()
+        .any(|a| a == "console=hvc0" || a.starts_with("console=hvc0,"))
+}
+
+/// What closing the GPU window does: through hvc0's SysRq hook, ask the guest
+/// kernel to sync and remount its filesystems read-only (SysRq s, u), wait for
+/// its disks to go quiet, then stop the VM. With `sysrq` false (hvc0 isn't a
+/// console, so the bytes would reach its tty instead) it just stops. Runs on a
+/// thread of its own, so the window thread doesn't wait.
+fn stop_on_window_close(
+    tag: &'static str,
+    console: Arc<ConsoleDevice>,
+    disks: Vec<Arc<BlockDevice>>,
+    sysrq: bool,
+    stop_all: impl Fn() + Send + 'static,
+) -> impl FnOnce() + Send + 'static {
+    move || {
+        let _ = std::thread::Builder::new()
+            .name("window-close".to_string())
+            .spawn(move || {
+                if sysrq {
+                    eprintln!(
+                        "\r\n[{tag}] window closed -- remounting the guest's filesystems \
+                         read-only (SysRq s, u), then stopping"
+                    );
+                    console.write_host_input(b"\x0fs\x0fu");
+                    wait_for_disks_to_settle(&disks);
+                } else {
+                    eprintln!(
+                        "\r\n[{tag}] window closed -- stopping (hvc0 is not a kernel console, \
+                         so no SysRq sync)"
+                    );
+                }
+                stop_all();
+            });
+    }
+}
+
+/// Wait until the guest's disks have settled: nothing in flight and no write,
+/// flush, discard or write-zeroes for a second. The SysRq work runs
+/// asynchronously in the guest, so wait at least half a second first, and at
+/// most 15 seconds in all.
+fn wait_for_disks_to_settle(disks: &[Arc<BlockDevice>]) {
+    use std::time::{Duration, Instant};
+    const MIN_WAIT: Duration = Duration::from_millis(500);
+    const QUIET: Duration = Duration::from_secs(1);
+    const MAX_WAIT: Duration = Duration::from_secs(15);
+    let writes = || -> u64 {
+        disks
+            .iter()
+            .map(|d| d.ops_out() + d.ops_flush() + d.ops_discard() + d.ops_write_zeroes())
+            .sum()
+    };
+    let start = Instant::now();
+    let mut last = writes();
+    let mut quiet_since = start;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = Instant::now();
+        let w = writes();
+        if w != last || disks.iter().any(|d| d.pending_count() > 0) {
+            last = w;
+            quiet_since = now;
+        }
+        let waited = now - start;
+        if waited >= MAX_WAIT || (waited >= MIN_WAIT && now - quiet_since >= QUIET) {
+            return;
+        }
+    }
 }
 
 /// Route the GPU window's input events into the virtio-input devices: keyboard
@@ -5068,17 +5223,18 @@ fn run_create_vhdx(args: &[String]) -> Result<i32> {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("vhdx"))
     {
-        return Err(Error::msg("--create-vhdx expects <path.vhdx> <size-mb>"));
+        return Err(Error::msg(
+            "--create-vhdx expects <path.vhdx> <size> (MiB, or with a K/M/G/T unit, e.g. 256G)",
+        ));
     }
     let min_mb = winsys::host::vhdx::MIN_SIZE / (1024 * 1024);
-    let size = args[3]
-        .parse::<u64>()
-        .ok()
-        .and_then(|mb| mb.checked_mul(1024 * 1024))
+    let size = cli::parse_disk_size(&args[3])
         .filter(|size| *size >= winsys::host::vhdx::MIN_SIZE)
         .ok_or_else(|| {
             Error::msg(format!(
-                "--create-vhdx size-mb must be an integer of at least {min_mb} (the VHDX minimum)"
+                "--create-vhdx: bad size '{}': want MiB, or a K/M/G/T unit (e.g. 256G), \
+                 of at least {min_mb} MiB (the VHDX minimum)",
+                args[3]
             ))
         })?;
     if std::path::Path::new(&args[2]).exists() {
@@ -5090,15 +5246,21 @@ fn run_create_vhdx(args: &[String]) -> Result<i32> {
     winsys::host::vhdx::create(&args[2], size)
         .map_err(|err| Error::msg(format!("--create-vhdx: '{}' failed: err={err}", args[2])))?;
     println!(
-        "Created '{}' ({} MiB, dynamic VHDX)",
+        "Created '{}' ({}, dynamic VHDX)",
         args[2],
-        size / (1024 * 1024)
+        cli::format_size(size)
     );
     Ok(0)
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args = match cli::expand_arg_files(std::env::args().collect()) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("tinyvmm error: {e}");
+            std::process::exit(1);
+        }
+    };
     if args.len() < 2 {
         print_usage();
         std::process::exit(1);
