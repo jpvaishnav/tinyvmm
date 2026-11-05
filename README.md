@@ -956,11 +956,21 @@ left. After tens of millions of doorbell signals (seen nested; a guest kicking
 one queue in a tight loop gets there in about 30 s) vid.sys can have taken one
 more than that count, and the wait never ends: the process can't exit, and only
 a host restart frees it. OpenVMM, which registers its virtio doorbells the same
-way, hangs the same way. tinyvmm can't avoid this, so it makes it cheap: once
+way, hangs the same way. tinyvmm cannot repair that driver wait, so it limits
+the resources a stuck process holds: once
 the vCPUs are joined, teardown stops every doorbell pump and device thread,
 closes the NAT's sockets and frees guest RAM before it unregisters a doorbell or
 deletes the partition (`ReleaseBeforeTeardown` in `main.rs`). A stuck process
 then holds a few MB and no ports, and warns after 10 s.
+
+Use `--no-doorbells` with `--pvh-run` or `--restore` to avoid this doorbell
+teardown path altogether. It disables WHP MMIO doorbell registration for
+console, net, blk, and 9p; queue notifications use the existing MMIO-exit
+handlers instead. This is a host-side choice, including when restoring a
+snapshot created with doorbells enabled, and leaves the guest's devices,
+MSI-X interrupts, and VMBus orderly shutdown unchanged. Doorbells remain
+enabled by default. The fallback takes a VM exit for each queue notification
+and may cost I/O performance.
 
 ---
 
